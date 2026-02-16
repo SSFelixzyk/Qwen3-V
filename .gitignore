@@ -1,5 +1,38 @@
-model/__pycache__
-out
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Models and Weights
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.h5
+*.ckpt
+model/vision_model/
+!model/vision_model/.gitkeep
+
+# Datasets
+*.parquet
+*.jsonl
+dataset/*.parquet
+dataset/*.jsonl
+dataset/pretrain_i2t.parquet
+images/
+
+# Outputs
+out/
+checkpoints/
+wandb/
+eval_result/
+
+# IDE and System
+.idea/
+.vscode/
+.DS_Store
+
+# Original ignores
 website/
 docs-minimind-v/
 测试.py

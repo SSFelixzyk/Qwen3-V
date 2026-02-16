@@ -7,7 +7,7 @@ import torch
 import io
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from model.model_vlm import MiniMindVLM
+from model.model_vlm import Qwen3VLM
 import pyarrow.parquet as pq
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"

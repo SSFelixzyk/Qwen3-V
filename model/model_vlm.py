@@ -4,78 +4,246 @@ import warnings
 from .model_minimind import *
 from typing import Optional, Tuple, List, Union
 from torch import nn
-from transformers import CLIPProcessor, CLIPModel
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers import AutoModel, AutoProcessor, Qwen3ForCausalLM, Qwen3Config
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 warnings.filterwarnings('ignore')
 
 
-class VLMConfig(MiniMindConfig):
-    model_type = "minimind-v"
+class VLMConfig(Qwen3Config):
+    """
+    VLM Configuration Class
+    -----------------------
+    Inherits from Qwen3Config to ensure compatibility with Qwen3's LLM structure.
+    Adds VLM-specific parameters for vision encoder and Deepstack projector.
+    """
+    model_type = "Qwen3-v"
 
     def __init__(
             self,
-            image_special_token: str = '@' * 196,
-            image_ids: List = [34] * 196,
+            # Qwen3 token IDs: <|image_pad|> = 151655
+            # We use 196 tokens as placeholder (14x14 patches)
+            image_special_token: str = '<|image_pad|>' * 196, 
+            image_ids: List = [151655] * 196, # List of token IDs representing the image placeholder
+            vision_select_layer: int = -1, # Default to last layer (unused if deepstack is True)
+            use_deepstack: bool = False,   # Whether to use Deepstack feature extraction
+            # SigLIP-Base has 12 layers. We select last 4 even layers: 12, 10, 8, 6 (indices -1, -3, -5, -7 or similar)
+            # Standard ViT features are often better from slightly earlier layers.
+            # Let's use indices compatible with 12 layers: [-2, -5, -8, -11]
+            deepstack_layers: List[int] = [-2, -5, -8, -11], # Layers to extract features from for Deepstack
             **kwargs,
     ):
         self.image_special_token = image_special_token
         self.image_ids = image_ids
+        self.vision_select_layer = vision_select_layer
+        self.use_deepstack = use_deepstack
+        self.deepstack_layers = deepstack_layers
         super().__init__(**kwargs)
 
-class VisionProj(nn.Module):
-    def __init__(self, ve_hidden_size=768, hidden_size=512):
+class DeepstackProjector(nn.Module):
+    """
+    Deepstack Projector
+    -------------------
+    An MLP that projects concatenated vision features to LLM's hidden size.
+    Structure: Linear -> GELU -> Linear
+    """
+    def __init__(self, input_hidden_size=768, output_hidden_size=1024):
         super().__init__()
-        self.ve_hidden_size = ve_hidden_size
-        self.hidden_size = hidden_size
-        self.vision_proj = nn.Sequential(
-            nn.Linear(self.ve_hidden_size, self.hidden_size)
+        self.input_hidden_size = input_hidden_size
+        self.output_hidden_size = output_hidden_size
+        self.net = nn.Sequential(
+            nn.Linear(input_hidden_size, output_hidden_size),
+            nn.GELU(),
+            nn.Linear(output_hidden_size, output_hidden_size)
         )
 
-    def forward(self, image_encoders):
-        vision_proj = self.vision_proj(image_encoders)
-        return vision_proj
+    def forward(self, image_features):
+        """
+        Forward pass for the projector.
+        
+        Args:
+            image_features: Tensor of shape [batch_size, seq_len, input_hidden_size]
+                            (e.g., [B, 196, 768 * num_layers])
+                            
+        Returns:
+            Tensor of shape [batch_size, seq_len, output_hidden_size]
+            (e.g., [B, 196, 1024] for Qwen3-0.6B)
+        """
+        return self.net(image_features)
 
 
-# 继承自语言模型
-class MiniMindVLM(MiniMindForCausalLM):
+class Qwen3VLM(Qwen3ForCausalLM):
+    """
+    Multi-modal Qwen3 Model
+    -----------------------
+    Integrates SigLIP2 vision encoder with Qwen3 LLM using a Deepstack Projector.
+    Inherits from Qwen3ForCausalLM to utilize its text generation capabilities.
+    """
     config_class = VLMConfig
 
-    def __init__(self, params: VLMConfig = None, vision_model_path="./model/vision_model/clip-vit-base-patch16"):
+    def __init__(self, params: VLMConfig = None, vision_model_path="./model/vision_model/siglip2-base-patch16-224"):
+        # Initialize Qwen2/3 model (LLM Backbone)
+        print("Initializing Qwen3 base model...")
         super().__init__(params)
-        if not params: params = VLMConfig()
-        self.params = params
+        print("Qwen3 base model initialized.")
+        
+        # Initialize Vision Components with SigLip
+        # vision_encoder: The loaded SigLIP model
+        # processor: The SigLIP image processor
+        print(f"Loading vision model from {vision_model_path}...")
         self.vision_encoder, self.processor = self.__class__.get_vision_model(vision_model_path)
-        self.vision_proj = VisionProj(hidden_size=params.hidden_size)
+        print("Vision components loaded.")
+        
+        # Determine input size for projector based on configuration
+        # If Deepstack is used, input size = vision_hidden_size * num_selected_layers
+        if getattr(params, 'use_deepstack', False):
+            ve_hidden_size = 768 * len(params.deepstack_layers)
+        else:
+            ve_hidden_size = 768
+            
+        # Initialize the Projector
+        print(f"Initializing DeepstackProjector with input_size={ve_hidden_size}...")
+        self.vision_proj = DeepstackProjector(input_hidden_size=ve_hidden_size, output_hidden_size=params.hidden_size)
+        print("Qwen3VLM init complete.")
 
     @staticmethod
     def get_vision_model(model_path: str):
+        """
+        Loads the Vision Encoder (SigLIP) and Processor.
+        
+        Args:
+            model_path: Path to the pretrained vision model folder.
+            
+        Returns:
+            model: The vision model (eval mode, frozen parameters).
+            processor: The image processor.
+        """
         from transformers import logging as hf_logging
         hf_logging.set_verbosity_error()
         if not os.path.exists(model_path):
+            print(f"Error: Vision model path {model_path} does not exist!")
             return None, None
-        model = CLIPModel.from_pretrained(model_path)
-        processor = CLIPProcessor.from_pretrained(model_path)
-        # 冻结 vision_encoder 的所有参数
+        # Load SigLIP or compatible model using AutoModel
+        print(f"Loading Vision Model from {model_path}...")
+        model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+        print("Vision Model loaded.")
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        print("Processor loaded.")
+        
+        # Force the vision model (inner) to output hidden states
+        # Critical fix: Some wrappers like SiglipModel don't propagate this from call arg by default?
+        model.config.output_hidden_states = True
+        if hasattr(model, 'vision_model'):
+            model.vision_model.config.output_hidden_states = True
+            
+        # Freeze vision encoder parameters to prevent updating them during VLM training
         for param in model.parameters():
             param.requires_grad = False
         return model.eval(), processor
 
     @staticmethod
     def image2tensor(image, processor):
+        """
+        Preprocesses a raw PIL image into a model-compatible tensor.
+        
+        Args:
+            image: PIL Image object.
+            processor: The image processor.
+            
+        Returns:
+            inputs: Tensor of shape [1, channels, height, width] 
+                   (e.g., [1, 3, 224, 224] for SigLIP-Base)
+        """
         if image.mode in ['RGBA', 'LA']: image = image.convert('RGB')
         inputs = processor(images=image, return_tensors="pt")['pixel_values']
         return inputs
 
     @staticmethod
-    def get_image_embeddings(image_tensors, vision_model):
+    def get_image_embeddings(image_tensors, vision_model, config=None):
+        """
+        Extracts image embeddings using the vision encoder (supports Deepstack).
+        """
         with torch.no_grad():
-            outputs = vision_model.vision_model(pixel_values=image_tensors)
-        img_embedding = outputs.last_hidden_state[:, 1:, :].squeeze()
+            # Robust extraction by bypassing potential wrapper bugs in SiglipVisionModel
+            # We access the internal 'vision_model' (SiglipVisionTransformer) and then 'embeddings' + 'encoder'
+            
+            # 1. Identify the inner SiglipVisionTransformer
+            if hasattr(vision_model, 'vision_model'):
+                inner_model = vision_model.vision_model
+            else:
+                inner_model = vision_model
+                
+            # 2. Compute Embeddings
+            hidden_states = inner_model.embeddings(pixel_values=image_tensors)
+            
+            # 3. Pass to Encoder with explicit output_hidden_states=True
+            encoder_outputs = inner_model.encoder(
+                inputs_embeds=hidden_states,
+                output_hidden_states=True,
+                return_dict=True
+            )
+        
+        # 4. Extract hidden_states
+        hidden_states = None
+        if hasattr(encoder_outputs, 'hidden_states'):
+             hidden_states = encoder_outputs.hidden_states
+        elif isinstance(encoder_outputs, tuple):
+             # Encoder output tuple: (last_hidden_state, hidden_states, attentions)
+             if len(encoder_outputs) >= 2:
+                 hidden_states = encoder_outputs[1]
+        
+        # 5. Handle Deepstack or Standard Output
+        if config and getattr(config, 'use_deepstack', False):
+            if hidden_states is None:
+                # print("Warning: hidden_states is None. Using last_hidden_state.")
+                img_embedding = encoder_outputs.last_hidden_state
+            else:
+                selected_features = []
+                deepstack_layers = getattr(config, 'deepstack_layers', [-2, -5, -8, -11])
+                for layer_idx in deepstack_layers:
+                    if -len(hidden_states) <= layer_idx < len(hidden_states):
+                        selected_features.append(hidden_states[layer_idx])
+                
+                if selected_features:
+                    img_embedding = torch.cat(selected_features, dim=-1)
+                else:
+                    img_embedding = encoder_outputs.last_hidden_state
+        else:
+            img_embedding = encoder_outputs.last_hidden_state
+        
+        # SigLIP includes a final LayerNorm after the encoder and before pooling/head
+        # The 'last_hidden_state' from encoder is pre-final-layernorm? 
+        # Actually SiglipVisionTransformer.forward applies post_layernorm on encoder class output.
+        # We should apply it too if we want "final" features, but for Deepstack we usually want raw encoder features.
+        # For the "standard" path (last_hidden_state), it should ideally be normalized.
+        
+        # Apply post_layernorm only to the final embedding if roughly matching standard behavior
+        # But `img_embedding` here is sequence of patches.
+        # inner_model.post_layernorm(img_embedding) is correct for the final layer.
+        # For Deepstack layers, we typically take them as-is (pre-final LN).
+        
+        if not getattr(config, 'use_deepstack', False):
+             img_embedding = inner_model.post_layernorm(img_embedding)
+        
         return img_embedding
 
     def count_vision_proj(self, tokens, h, vision_tensors=None, seqlen=512):
+        """
+        Injects projected vision features into the LLM's text embeddings.
+        This function locates the special image placeholder tokens in the input sequence
+        and replaces their corresponding embeddings with the projected vision features.
+        
+        Args:
+            tokens: Input token IDs. Shape: [batch_size, seq_len]
+            h: Text embeddings from LLM. Shape: [batch_size, seq_len, hidden_size]
+            vision_tensors: Vision features. Shape: [batch_size, num_images, seq_len_vis, feature_dim]
+            seqlen: Max sequence length for truncation.
+            
+        Returns:
+            Modified embeddings with vision features injected. Shape: [batch_size, seq_len, hidden_size]
+        """
         def find_indices(tokens, image_ids):
+            """Finds start and end indices of the image placeholder tokens."""
             image_ids_tensor = torch.tensor(image_ids).to(tokens.device)
             len_image_ids = len(image_ids)
             if len_image_ids > tokens.size(1):
@@ -88,82 +256,124 @@ class MiniMindVLM(MiniMindForCausalLM):
                 for batch_idx in range(tokens.size(0)) if matches[batch_idx].any()
             } or None
 
-        image_indices = find_indices(tokens, self.params.image_ids)
+        image_indices = find_indices(tokens, self.params.image_ids) # {batch_idx: [(start_idx, end_idx), ...]}
         if vision_tensors is not None and image_indices:
+            # Project vision features to LLM hidden size
+            # vision_proj: [batch_size, num_images, seq_len_vis, llm_hidden_size]
             vision_proj = self.vision_proj(vision_tensors)
+            
             if len(vision_proj.shape) == 3:
-                vision_proj = vision_proj.unsqueeze(0)
+                vision_proj = vision_proj.unsqueeze(0) # [1, num_images, seq_len_vis, llm_hidden_size]
+            
             new_h = []
             for i in range(h.size(0)):
                 if i in image_indices:
-                    h_i = h[i]
+                    h_i = h[i] # [seq_len, hidden_size]
                     img_idx = 0
+                    # Replace placeholder embeddings with vision embeddings
                     for start_idx, end_idx in image_indices[i]:
                         if img_idx < vision_proj.size(1):
+                            # Concatenate: [pre_img, vision_feat, post_img]
+                            # Dimensions:
+                            # h_i[:start_idx]: [start_idx, hidden_size]
+                            # vision_proj[i][img_idx]: [seq_len_vis, hidden_size]
+                            # h_i[end_idx + 1:]: [remaining, hidden_size]
                             h_i = torch.cat((h_i[:start_idx], vision_proj[i][img_idx], h_i[end_idx + 1:]), dim=0)[
                                   :seqlen]
                             img_idx += 1
                     new_h.append(h_i)
                 else:
                     new_h.append(h[i])
-            return torch.stack(new_h, dim=0)
+            return torch.stack(new_h, dim=0) # [batch_size, seq_len, hidden_size]
         return h
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False,
-                logits_to_keep: Union[int, torch.Tensor] = 0,
+                inputs_embeds: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
+                use_cache: bool = None,
+                output_attentions: bool = None,
+                output_hidden_states: bool = None,
+                return_dict: bool = None,
                 pixel_values: Optional[torch.FloatTensor] = None,
                 **args):
-        batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
-        past_key_values = past_key_values or [None] * len(self.model.layers)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-
-        hidden_states = self.model.dropout(self.model.embed_tokens(input_ids))
-
-        if pixel_values is not None and start_pos == 0:
-            if len(pixel_values.shape) == 6:
-                pixel_values = pixel_values.squeeze(2)
-            bs, num, c, im_h, im_w = pixel_values.shape
-            stack_dim = 1 if bs > 1 else 0
-            vision_tensors = torch.stack([
-                MiniMindVLM.get_image_embeddings(pixel_values[:, i, :, :, :], self.vision_encoder)
-                for i in range(num)
-            ], dim=stack_dim)
-            hidden_states = self.count_vision_proj(tokens=input_ids, h=hidden_states, vision_tensors=vision_tensors,
-                                                   seqlen=input_ids.shape[1])
-
-        position_embeddings = (
-            self.model.freqs_cos[start_pos:start_pos + seq_length],
-            self.model.freqs_sin[start_pos:start_pos + seq_length]
+        """
+        Forward pass of the VLM.
+        
+        Args:
+            input_ids: Token IDs. Shape: [batch_size, seq_len]
+            pixel_values: Input images. 
+                          Shape: [batch_size, num_images, channels, height, width] 
+                          or [batch_size, channels, height, width] (single image)
+            ... (other standard Qwen args)
+            
+        Returns:
+            CausalLMOutputWithPast: Object containing loss, logits, and other outputs.
+        """
+        
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        presents = []
-        for layer_idx, (layer, past_key_value) in enumerate(zip(self.model.layers, past_key_values)):
-            hidden_states, present = layer(
-                hidden_states,
-                position_embeddings,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attention_mask=attention_mask
-            )
-            presents.append(present)
+        # If inputs_embeds not provided, compute from input_ids (Text Embeddings)
+        # inputs_embeds: [batch_size, seq_len, hidden_size]
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
 
-        hidden_states = self.model.norm(hidden_states)
+        # Inject Vision Features if images are provided
+        if pixel_values is not None:
+            # Handle potential 5D input (b, n_images, c, h, w) or 4D (b, c, h, w)
+            
+            # Case 1: 5D input [batch, num_images, channels, height, width]
+            if len(pixel_values.shape) == 5: 
+                 bs, num, c, im_h, im_w = pixel_values.shape
+                 # Flatten to [batch * num_images, c, h, w] for efficient processing
+                 pixel_values_flat = pixel_values.view(bs * num, c, im_h, im_w)
+                 
+                 # Get embeddings for all images: [batch*num, seq_len_vis, feature_dim]
+                 vision_tensors_flat = MiniMindVLM.get_image_embeddings(pixel_values_flat, self.vision_encoder, self.config)
+                 
+                 # Reshape back to [batch, num, seq_len_vis, feature_dim]
+                 seq_len_vis = vision_tensors_flat.shape[1]
+                 feature_dim = vision_tensors_flat.shape[2]
+                 vision_tensors = vision_tensors_flat.view(bs, num, seq_len_vis, feature_dim)
+            
+            # Case 2: 6D input (legacy/edge case) - Remove extra dim
+            elif len(pixel_values.shape) == 6:
+                pixel_values = pixel_values.squeeze(2) 
+                # (Then process as Case 1 or 3 depending on shape, but simplified here)
+                bs, num, c, im_h, im_w = pixel_values.shape
+                pixel_values_flat = pixel_values.view(bs * num, c, im_h, im_w)
+                vision_tensors_flat = MiniMindVLM.get_image_embeddings(pixel_values_flat, self.vision_encoder, self.config)
+                vision_tensors = vision_tensors_flat.view(bs, num, -1, vision_tensors_flat.shape[-1])
 
-        aux_loss = sum([l.mlp.aux_loss for l in self.model.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+            # Case 3: 4D input [batch, c, h, w] (Single image per sample)
+            elif len(pixel_values.shape) == 4:
+                 vision_tensors = MiniMindVLM.get_image_embeddings(pixel_values, self.vision_encoder, self.config)
+                 # Add num_images dim: [batch, 1, seq_len_vis, feature_dim]
+                 vision_tensors = vision_tensors.unsqueeze(1)
+            
+            else:
+                raise ValueError(f"Unexpected pixel_values shape: {pixel_values.shape}")
 
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
-        output = MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=presents, hidden_states=hidden_states)
-        return output
+            # Perform Feature Injection (Replace text placeholders with image features)
+            # inputs_embeds will be modified in-place or replaced
+            inputs_embeds = self.count_vision_proj(tokens=input_ids, h=inputs_embeds, vision_tensors=vision_tensors, seqlen=input_ids.shape[1])
+
+        # Standard Qwen2/3 forward pass with modified embeddings
+        return super().forward(
+            input_ids=None, # We provide inputs_embeds instead
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
