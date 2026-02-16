@@ -39,7 +39,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         # pixel_values: [batch_size, channels, height, width] (or 5D with num_images)
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
-        pixel_values = pixel_values.to(args.device)
+        # pixel_values = pixel_values.to(args.device) 已经在model_vlm里面实现
         
         # Update Learning Rate
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -49,14 +49,16 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         # Forward Pass with Mixed Precision
         with autocast_ctx:
             res = model(input_ids, labels=labels, pixel_values=pixel_values)
-            loss = res.loss + res.aux_loss
+            aux_loss = getattr(res, "aux_loss", None)
+            aux_loss_val = aux_loss.item() if aux_loss is not None else 0.0
+            loss = res.loss + (aux_loss if aux_loss is not None else 0.0)
             loss = loss / args.accumulation_steps
 
         # Backward Pass
         scaler.scale(loss).backward()
 
         # Optimizer Step (Gradient Accumulation)
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
@@ -69,7 +71,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
-            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            current_loss = loss.item() * args.accumulation_steps
+            current_aux_loss = aux_loss_val
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
@@ -125,7 +128,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", default=1, action="store_true", help="Enable WandB logging")
     parser.add_argument("--wandb_project", type=str, default="Qwen3-V-Pretrain", help="WandB project name")
     parser.add_argument('--model_path', type=str, default='../Models/Qwen3-0.6B', help="Path to Qwen3 model (tokenizer & base)")
-    parser.add_argument('--enable_thinking', default=1, type=int, choices=[0, 1], help="Enable/Disable thinking mode (0=No, 1=Yes)")
+    parser.add_argument('--enable_thinking', default=0, type=int, choices=[0, 1], help="Enable/Disable thinking mode (0=No, 1=Yes)")
     args = parser.parse_args()
 
     # ========== 1. Environment & Seed Setup ==========
@@ -136,8 +139,21 @@ if __name__ == "__main__":
     
     # ========== 2. Configuration & Checkpoint ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    vlm_config = VLMConfig(use_moe=args.use_moe, use_deepstack=args.use_deepstack, max_seq_len=args.max_seq_len, enable_thinking=args.enable_thinking)
-    Logger(f"VLM Config created. MOE: {args.use_moe}, DeepStack: {args.use_deepstack}, Thinking: {args.enable_thinking}")
+    # Load config from model path to ensure correct model size (e.g. 0.6B instead of default)
+    try:
+        Logger(f"Loading config from {args.model_path}...")
+        vlm_config = VLMConfig.from_pretrained(args.model_path, trust_remote_code=True)
+        # Update with CLI args
+        vlm_config.use_moe = bool(args.use_moe)
+        vlm_config.use_deepstack = bool(args.use_deepstack)
+        vlm_config.max_seq_len = args.max_seq_len
+        vlm_config.enable_thinking = bool(args.enable_thinking)
+    except Exception as e:
+        Logger(f"Failed to load config from {args.model_path}: {e}. Falling back to default VLMConfig (Risk of OOM if defaults are large).")
+        vlm_config = VLMConfig(use_moe=args.use_moe, use_deepstack=args.use_deepstack, max_seq_len=args.max_seq_len, enable_thinking=args.enable_thinking)
+    
+    Logger(f"VLM Config created. Hidden size: {vlm_config.hidden_size}, Layers: {vlm_config.num_hidden_layers}")
+    Logger(f"MOE: {vlm_config.use_moe}, DeepStack: {vlm_config.use_deepstack}, Thinking: {getattr(vlm_config, 'enable_thinking', 'N/A')}")
     # Disable thinking if requested
     if args.enable_thinking == 0:
         if hasattr(vlm_config, 'enable_thinking'):
@@ -164,7 +180,8 @@ if __name__ == "__main__":
     # ========== 5. Model, Tokenizer, Data, Optimizer ==========
     # Initialize Model
     Logger("Initializing model...")
-    model, tokenizer, preprocess = init_vlm_model(vlm_config, from_weight=args.from_weight, tokenizer_path=args.model_path, device=args.device, freeze_llm=bool(args.freeze_llm))
+    weight_path = args.model_path if args.from_weight == 'llm' else args.from_weight
+    model, tokenizer, preprocess = init_vlm_model(vlm_config, from_weight=weight_path, tokenizer_path=args.model_path, device=args.device, freeze_llm=bool(args.freeze_llm))
     Logger("Model initialized.")
     if args.use_compile == 1:
         model = torch.compile(model)

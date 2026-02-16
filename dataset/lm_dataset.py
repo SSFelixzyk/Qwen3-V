@@ -68,7 +68,7 @@ class VLMDataset(Dataset):
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
         labels = self.generate_labels(input_ids)
 
-        image_tensor = torch.stack([MiniMindVLM.image2tensor(Image.open(io.BytesIO(img)), self.preprocess) for img in image_bytes])
+        image_tensor = torch.stack([Qwen3VLM.image2tensor(Image.open(io.BytesIO(img)), self.preprocess) for img in image_bytes])
         # # === 调试打印 ===
         # print(f"\n--- Sample {index} ---")
         # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
